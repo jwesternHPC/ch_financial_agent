@@ -1,0 +1,27 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Output files
+*_financial_analysis.xlsx
+Results/
+
+# Debug, test and one-off exploration scripts
+debug_*.py
+test_*.py
+check_*.py
+inspect_*.py
+direct_*.py
+extract_*.py
+final_*.py
+find_*.py
+list_*.py
+quick_*.py
+search_*.py
+debug_xbrl_candidates.txt
+
+# Sample / scratch data files
+*.xml
+*.ipynb
