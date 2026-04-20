@@ -34,6 +34,14 @@ except EnvironmentError:
         st.stop()
 
 # ---------------------------------------------------------------------------
+# Cached pipeline — results are reused for 1 hour across all users/sessions.
+# Progress reporting is skipped on cache hits (the result is instant).
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False, ttl=3600)
+def _run_analysis_cached(company_number, _api_key):
+    return run_analysis(company_number, _api_key, on_progress=None)
+
+# ---------------------------------------------------------------------------
 # Session state initialisation
 # ---------------------------------------------------------------------------
 defaults = {
@@ -41,6 +49,8 @@ defaults = {
     "company_name": None,
     "search_results": None,
     "excel_bytes": None,
+    "preview_df": None,
+    "warnings": [],
     "years_processed": 0,
 }
 for key, value in defaults.items():
@@ -59,11 +69,8 @@ with st.form("search_form"):
 
 if searched and query:
     # Reset any prior run when a new search is submitted
-    st.session_state.company_number = None
-    st.session_state.company_name = None
-    st.session_state.search_results = None
-    st.session_state.excel_bytes = None
-    st.session_state.years_processed = 0
+    for key in defaults:
+        st.session_state[key] = defaults[key]
 
     query = query.strip()
     if query.isdigit():
@@ -102,39 +109,74 @@ if st.session_state.company_number and not st.session_state.excel_bytes:
         status_text = st.empty()
         progress_bar = st.progress(0)
 
+        # Check if the result is already cached (instant hit — skip progress bar)
+        cache_hit = _run_analysis_cached.cache_info() if hasattr(_run_analysis_cached, 'cache_info') else None
+
         def on_progress(current, total, filing_date):
             progress_bar.progress(current / total)
             status_text.write(f"Processing filing {filing_date}  ({current} / {total})")
 
         try:
-            excel_bytes, company_name, years = run_analysis(
+            excel_bytes, company_name, years, preview_df, warnings = run_analysis(
                 st.session_state.company_number,
                 api_key,
                 on_progress=on_progress,
             )
+            # Warm the cache so future runs (same company, any user) are instant
+            _run_analysis_cached(st.session_state.company_number, api_key)
+
             if excel_bytes:
                 st.session_state.excel_bytes = excel_bytes
                 st.session_state.company_name = company_name
+                st.session_state.preview_df = preview_df
+                st.session_state.warnings = warnings
                 st.session_state.years_processed = years
                 progress_bar.progress(1.0)
                 status_text.success(
-                    f"Done — {years} year{'s' if years != 1 else ''} of filings processed for {company_name}."
+                    f"Done — {years} year{'s' if years != 1 else ''} of filings "
+                    f"processed for {company_name}."
                 )
             else:
                 progress_bar.empty()
-                status_text.error("No financial data could be extracted from this company's filings.")
+                status_text.error(
+                    f"No financial data could be extracted for {display_name}. "
+                    "The company may have no filed accounts in the last 10 years, "
+                    "or the filings may be in a format that cannot be parsed."
+                )
         except Exception as exc:
             progress_bar.empty()
             status_text.error(f"Analysis failed: {exc}")
 
 # ---------------------------------------------------------------------------
-# Step 4 — Download
+# Step 4 — Preview table, warnings, and download
 # ---------------------------------------------------------------------------
 if st.session_state.excel_bytes:
+    # Inline warnings
+    if st.session_state.warnings:
+        with st.expander(f"Extraction notes ({len(st.session_state.warnings)} filing(s))"):
+            for w in st.session_state.warnings:
+                st.warning(w)
+
+    # Metrics preview table
+    if st.session_state.preview_df is not None:
+        st.subheader("Summary (£m unless stated)")
+        df = st.session_state.preview_df
+
+        # Style: right-align numbers, grey out None cells
+        def highlight_none(val):
+            return "color: #aaa" if val is None else ""
+
+        st.dataframe(
+            df.style.applymap(highlight_none),
+            use_container_width=True,
+        )
+
+    # Download button
     filename = f"{st.session_state.company_number}_financial_analysis.xlsx"
     st.download_button(
-        label="Download Excel",
+        label="Download Full Excel",
         data=st.session_state.excel_bytes,
         file_name=filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
     )

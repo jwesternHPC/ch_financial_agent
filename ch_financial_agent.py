@@ -1,4 +1,5 @@
 import os
+import threading
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -7,6 +8,7 @@ import logging
 import re
 import numpy as np
 import time
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from copy import copy
 from openpyxl import load_workbook
@@ -216,17 +218,24 @@ def get_api_key():
     return key
 
 
-def request_with_retries(url, auth=None, params=None, headers=None, timeout=30, retries=2):
-    """Make an HTTP GET request with retry support and clear network error messages."""
+def request_with_retries(url, auth=None, params=None, headers=None, timeout=30, retries=3):
+    """Make an HTTP GET request with retry support, handling both network errors and 429 rate limits."""
     for attempt in range(retries):
         try:
-            return requests.get(url, auth=auth, params=params, headers=headers, timeout=timeout)
+            response = requests.get(url, auth=auth, params=params, headers=headers, timeout=timeout)
+            if response.status_code == 429:
+                wait = int(response.headers.get('Retry-After', 2 ** (attempt + 1)))
+                logger.warning("Rate limited (429) for %s — retrying in %ds...", url, wait)
+                time.sleep(wait)
+                continue
+            return response
         except requests.exceptions.RequestException as e:
-            err = str(e)
             if attempt == retries - 1:
-                logger.error("Network request failed for %s: %s", url, err)
+                logger.error("Network request failed for %s: %s", url, e)
                 return None
             time.sleep(1)
+    logger.error("All %d retries exhausted for %s", retries, url)
+    return None
 
 
 def get_company_name(company_number, api_key):
@@ -2014,39 +2023,110 @@ def build_excel_workbook(all_metrics, company_name):
     return output.read()
 
 
+def build_preview_df(all_metrics):
+    """Build a concise year-by-year summary table for display in the web UI.
+
+    Monetary values are expressed in £m; percentages and employee counts as-is.
+    Returns a DataFrame with metrics as rows and filing years as columns.
+    """
+    PREVIEW_METRICS = [
+        ('Revenue',             'money'),
+        ('Gross Profit',        'money'),
+        ('Gross Margin (%)',    'pct'),
+        ('EBITDA',              'money'),
+        ('EBITDA Margin (%)',   'pct'),
+        ('Net Income',          'money'),
+        ('Net Debt',            'money'),
+        ('Number of Employees', 'count'),
+    ]
+
+    sorted_metrics = sorted(
+        all_metrics,
+        key=lambda m: pd.to_datetime(m.get('Filing_Date') or '1900-01-01')
+    )
+
+    # Build display column labels (e.g. "Apr-24"), deduplicating by year (keep last)
+    seen_years = {}
+    for m in sorted_metrics:
+        dt = pd.to_datetime(m.get('Filing_Date') or '')
+        label = dt.strftime('%b-%y') if pd.notna(dt) else '?'
+        year = dt.year if pd.notna(dt) else 0
+        seen_years[year] = (label, m)
+    deduped = list(seen_years.values())[-TEMPLATE_MAX_YEARS:]
+    col_labels = [label for label, _ in deduped]
+    col_metrics = [m for _, m in deduped]
+
+    rows = {}
+    for metric_name, fmt in PREVIEW_METRICS:
+        row = {}
+        for col, m in zip(col_labels, col_metrics):
+            val = m.get(metric_name)
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                row[col] = None
+            elif fmt == 'money':
+                row[col] = round(float(val) / 1_000_000, 1)
+            elif fmt == 'pct':
+                row[col] = round(float(val), 1)
+            elif fmt == 'count':
+                row[col] = int(round(float(val)))
+            else:
+                row[col] = val
+        rows[metric_name] = row
+
+    df = pd.DataFrame(rows).T
+    df.index.name = None
+    return df
+
+
 def run_analysis(company_number, api_key, on_progress=None):
     """Run the full filing retrieval and extraction pipeline for a company.
+
+    Filings are downloaded in parallel (up to 5 concurrent requests) for speed.
 
     Args:
         company_number: 8-digit Companies House company number.
         api_key: Companies House API key.
-        on_progress: optional callable(current, total, filing_date) called
-                     after each filing is processed.
+        on_progress: optional callable(current, total, filing_date) called after
+                     each filing completes (may be called from a worker thread).
 
     Returns:
-        (excel_bytes, company_name, years_processed).
+        (excel_bytes, company_name, years_processed, preview_df, warnings).
         excel_bytes is None if no data could be extracted.
+        preview_df is a summary DataFrame for display; warnings is a list of strings.
     """
     company_name = get_company_name(company_number, api_key)
     filings = get_accounts_filings(company_number, api_key, years=10)
     if not filings:
-        return None, company_name, 0
+        return None, company_name, 0, None, []
 
-    all_metrics = []
     total = len(filings)
-    for i, filing in enumerate(filings):
-        filing_date = filing.get('date', '')
+    completed = [0]
+    lock = threading.Lock()
+
+    def _fetch(filing):
+        result = download_and_parse_accounts(company_number, filing, api_key)
+        with lock:
+            completed[0] += 1
+            count = completed[0]
         if on_progress:
-            on_progress(i + 1, total, filing_date)
-        metrics = download_and_parse_accounts(company_number, filing, api_key)
-        if metrics:
-            all_metrics.append(metrics)
+            on_progress(count, total, filing.get('date', ''))
+        return result
 
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        results = list(executor.map(_fetch, filings))
+
+    all_metrics = [m for m in results if m is not None]
     if not all_metrics:
-        return None, company_name, 0
+        return None, company_name, 0, None, []
 
+    warnings = [
+        f"{m.get('Filing_Date', 'Unknown date')}: {m['Warning'].strip()}"
+        for m in all_metrics
+        if m.get('Warning', '').strip()
+    ]
+    preview_df = build_preview_df(all_metrics)
     excel_bytes = build_excel_workbook(all_metrics, company_name)
-    return excel_bytes, company_name, len(all_metrics)
+    return excel_bytes, company_name, len(all_metrics), preview_df, warnings
 
 
 def main():
@@ -2071,7 +2151,9 @@ def main():
         def on_progress(current, total, filing_date):
             print(f"Processing accounts for {filing_date} ({current}/{total})...")
 
-        excel_bytes, company_name, years = run_analysis(company_number, api_key, on_progress=on_progress)
+        excel_bytes, company_name, years, *_ = run_analysis(
+            company_number, api_key, on_progress=on_progress
+        )
         if not excel_bytes:
             print("No financial data could be extracted from filings.")
             return
