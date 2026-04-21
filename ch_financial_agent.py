@@ -1,5 +1,4 @@
 import os
-import threading
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -8,7 +7,7 @@ import logging
 import re
 import numpy as np
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from copy import copy
 from openpyxl import load_workbook
@@ -2100,20 +2099,24 @@ def run_analysis(company_number, api_key, on_progress=None):
         return None, company_name, 0, None, []
 
     total = len(filings)
-    completed = [0]
-    lock = threading.Lock()
 
-    def _fetch(filing):
-        result = download_and_parse_accounts(company_number, filing, api_key)
-        with lock:
-            completed[0] += 1
-            count = completed[0]
-        if on_progress:
-            on_progress(count, total, filing.get('date', ''))
-        return result
-
+    # Submit all filings concurrently; collect results in original order.
+    # on_progress is called from THIS thread (not the workers) to keep
+    # Streamlit UI updates on the script thread where they are required.
     with ThreadPoolExecutor(max_workers=5) as executor:
-        results = list(executor.map(_fetch, filings))
+        future_map = {
+            executor.submit(download_and_parse_accounts, company_number, filing, api_key): (i, filing)
+            for i, filing in enumerate(filings)
+        }
+        results = [None] * total
+        for done_count, future in enumerate(as_completed(future_map), 1):
+            i, filing = future_map[future]
+            try:
+                results[i] = future.result()
+            except Exception as exc:
+                logger.error("Error processing filing %s: %s", filing.get('date'), exc, exc_info=True)
+            if on_progress:
+                on_progress(done_count, total, filing.get('date', ''))
 
     all_metrics = [m for m in results if m is not None]
     if not all_metrics:

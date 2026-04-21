@@ -106,46 +106,29 @@ if st.session_state.company_number and not st.session_state.excel_bytes:
     st.write(f"**Selected:** {display_name}")
 
     if st.button("Run Analysis", type="primary"):
-        status_text = st.empty()
-        progress_bar = st.progress(0)
-
-        # Check if the result is already cached (instant hit — skip progress bar)
-        cache_hit = _run_analysis_cached.cache_info() if hasattr(_run_analysis_cached, 'cache_info') else None
-
-        def on_progress(current, total, filing_date):
-            progress_bar.progress(current / total)
-            status_text.write(f"Processing filing {filing_date}  ({current} / {total})")
-
         try:
-            excel_bytes, company_name, years, preview_df, warnings = run_analysis(
-                st.session_state.company_number,
-                api_key,
-                on_progress=on_progress,
-            )
-            # Warm the cache so future runs (same company, any user) are instant
-            _run_analysis_cached(st.session_state.company_number, api_key)
-
+            with st.spinner(f"Analysing {display_name}... (first run may take up to a minute)"):
+                excel_bytes, company_name, years, preview_df, warnings = _run_analysis_cached(
+                    st.session_state.company_number, api_key
+                )
             if excel_bytes:
                 st.session_state.excel_bytes = excel_bytes
                 st.session_state.company_name = company_name
                 st.session_state.preview_df = preview_df
                 st.session_state.warnings = warnings
                 st.session_state.years_processed = years
-                progress_bar.progress(1.0)
-                status_text.success(
+                st.success(
                     f"Done — {years} year{'s' if years != 1 else ''} of filings "
                     f"processed for {company_name}."
                 )
             else:
-                progress_bar.empty()
-                status_text.error(
+                st.error(
                     f"No financial data could be extracted for {display_name}. "
                     "The company may have no filed accounts in the last 10 years, "
                     "or the filings may be in a format that cannot be parsed."
                 )
         except Exception as exc:
-            progress_bar.empty()
-            status_text.error(f"Analysis failed: {exc}")
+            st.error(f"Analysis failed: {exc}")
 
 # ---------------------------------------------------------------------------
 # Step 4 — Preview table, warnings, and download
@@ -167,7 +150,7 @@ if st.session_state.excel_bytes:
             return "color: #aaa" if val is None else ""
 
         st.dataframe(
-            df.style.applymap(highlight_none),
+            df.style.map(highlight_none),
             use_container_width=True,
         )
 
